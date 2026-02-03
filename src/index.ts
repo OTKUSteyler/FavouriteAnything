@@ -1,304 +1,297 @@
 /**
  * FavouriteAnything — Kettu / Bunny Plugin
  *
- * Adds a "⭐ Favourite" option to the long-press message action sheet
- * whenever the held message contains an image or video attachment / embed.
+ * Adds a "⭐ Favourite" button to the long-press message ActionSheet
+ * whenever the message contains an image or video (attachment or embed).
+ * Tapping it calls Discord's own internal favourites API (the same one
+ * the GIF picker uses), so the image/video shows up in your real
+ * Discord Favourites tab — no separate local storage needed.
  *
- * Original Vencord plugin by nin0 & Davri (GPL-3.0-or-later)
- * Ported to Kettu by: [Your Name]
- *
- * --------------------------------------------------------------------------
- * HOW IT WORKS
- * --------------------------------------------------------------------------
- * When you long-press a message on Discord mobile, Discord builds an array
- * of action-sheet items by calling an internal function (commonly exposed via
- * a module that owns "getMessageActions" or "MessageActions").
- *
- * This plugin uses patcher.after() on that function.  The "after" hook runs
- * AFTER the original returns, so we still get every default menu item.  We
- * then inspect the message for image/video content and, if found, push our
- * own action item onto the end of the array.
- *
- * Pressing "⭐ Favourite" calls Discord's own internal GIF-favourites API
- * (the same one the native "Add to favourites" GIF button uses).  If that
- * API isn't reachable at runtime the plugin falls back to downloading the
- * image via the standard share / save flow.
- * --------------------------------------------------------------------------
+ * Original Vencord plugin by: nin0 (Devs.nin0dev), Davri (457579346282938368)
+ * Original license: GPL-3.0-or-later
+ * Ported for Kettu/Bunny by: [Your Name]
  */
 
-// ---------------------------------------------------------------------------
-// Kettu / Bunny runtime imports
-// ---------------------------------------------------------------------------
-// Adjust these paths if your specific Kettu build uses different module names.
-// Common alternatives:  "@bunny/modules"  /  "@vendetta/metro-modules"
-const {
-  findByProps,
-  findByDisplayName,
-} = require("@vendetta/metro-modules");
-
-const { patcher } = require("@vendetta/patcher");
-
-// React Native built-ins — always available inside the Discord bundle
-const { Share, ToastAndroid, Platform } = require("react-native");
+import { findByProps } from "@vendetta/metro";
 
 // ---------------------------------------------------------------------------
-// Helpers – locate Discord internals
+// Lazy module cache — resolved once on first use, then reused
 // ---------------------------------------------------------------------------
+let _favouritesAPI  = null;   // { addToFavorites, removeFromFavorites }
+let _messageActions = null;   // module whose action-builder we patch
 
 /**
- * Returns the module that owns the message-actions array builder.
- *
- * Discord's minified bundle changes frequently, so we try several known
- * property signatures.  The first one that resolves wins.  If none match
- * you'll need to use the ActionSheetFinder dev plugin to locate the current
- * key at runtime.
- *
- * Known candidates (as of late 2024 / early 2025 builds):
- *   "getMessageActions"
- *   "messageActions"
- *   "buildMessageActions"
+ * Discord's internal favourites API.
+ * Same one the GIF picker calls.  We find it by two props that have
+ * been stable across many Discord builds.
  */
-function findMessageActionsModule() {
-  const candidates = [
-    "getMessageActions",
-    "messageActions",
-    "buildMessageActions",
-    "MessageActions",
-  ];
-
-  for (const key of candidates) {
+function getFavouritesAPI() {
+    if (_favouritesAPI) return _favouritesAPI;
     try {
-      const mod = findByProps(key);
-      if (mod) return { module: mod, key };
-    } catch (_) {
-      // findByProps throws when nothing matches — keep trying
+        _favouritesAPI = findByProps("addToFavorites", "removeFromFavorites");
+    } catch (e) {
+        console.warn("[FavouriteAnything] Could not find favourites API:", e);
     }
-  }
-  return null;
+    return _favouritesAPI;
 }
 
 /**
- * Locate Discord's internal GIF / media favourites utility.
- * It typically lives on a module that also exports "addToFavorites".
+ * The module that builds the options array shown in the long-press
+ * ActionSheet.  We locate it by two action-key strings that Discord
+ * always includes: "markAsUnread" and "suppressEmbeds".
+ *
+ * If Discord ever renames these internally, update the strings here.
  */
-function findFavoritesModule() {
-  try {
-    return findByProps("addToFavorites");
-  } catch (_) {
-    return null;
-  }
+function getMessageActionsModule() {
+    if (_messageActions) return _messageActions;
+    try {
+        _messageActions = findByProps("markAsUnread", "suppressEmbeds");
+    } catch (e) {
+        console.warn("[FavouriteAnything] Could not find MessageActions module:", e);
+    }
+    return _messageActions;
 }
 
 // ---------------------------------------------------------------------------
-// Image / video extraction
+// Helpers — pull image / video info out of a Discord message object
 // ---------------------------------------------------------------------------
 
+/** Format values matching Discord's internal enum */
+const Format = { IMAGE: 1, VIDEO: 2 };
+
 /**
- * Pull every image or video URL out of a Discord message object.
+ * Walk a message's attachments and embeds and return the first
+ * image or video found, or null.
  *
- * A message can contain media in two places:
- *   1. message.attachments  – files the user uploaded directly
- *   2. message.embeds       – rich-embed objects (link previews, gifv, etc.)
- *
- * We return an array of  { url, proxyUrl, isVideo }  descriptors so the
- * action handler knows what to favourite / download.
+ * @param {object} message   raw Discord message
+ * @returns {{ url, proxyURL, width, height, isVideo } | null}
  */
 function extractMedia(message) {
-  const media = [];
+    if (!message) return null;
 
-  // --- attachments (direct uploads) ----------------------------------------
-  if (Array.isArray(message?.attachments)) {
-    for (const att of message.attachments) {
-      const contentType = (att.content_type || att.contentType || "").toLowerCase();
-      if (contentType.startsWith("image/")) {
-        media.push({
-          url: att.url,
-          proxyUrl: att.proxy_url || att.proxyURL || att.url,
-          isVideo: false,
-        });
-      } else if (contentType.startsWith("video/")) {
-        media.push({
-          url: att.url,
-          proxyUrl: att.proxy_url || att.proxyURL || att.url,
-          isVideo: true,
-        });
-      }
+    // --- Attachments (files the user uploaded directly) ---
+    if (Array.isArray(message.attachments)) {
+        for (const att of message.attachments) {
+            const ct = (att.content_type || "").split(";")[0];
+            if (ct.startsWith("image/") || ct.startsWith("video/")) {
+                return {
+                    url:     att.url,
+                    proxyURL: att.proxy_url || att.url,
+                    width:   att.width  || 0,
+                    height:  att.height || 0,
+                    isVideo: ct.startsWith("video/")
+                };
+            }
+        }
     }
-  }
 
-  // --- embeds (link-previews / gifv / rich) ----------------------------------
-  if (Array.isArray(message?.embeds)) {
-    for (const embed of message.embeds) {
-      // gifv embeds  (e.g. Tenor / Giphy)
-      if (embed.type === "gifv" && embed.video) {
-        media.push({
-          url: embed.url || embed.video.url,
-          proxyUrl: embed.video.proxy_url || embed.video.proxyURL || embed.video.url,
-          isVideo: true,
-        });
-      }
-      // rich / link embeds that carry an image
-      if (embed.image) {
-        media.push({
-          url: embed.image.url,
-          proxyUrl: embed.image.proxy_url || embed.image.proxyURL || embed.image.url,
-          isVideo: false,
-        });
-      }
-      // video embeds without gifv type
-      if (embed.video && embed.type !== "gifv") {
-        media.push({
-          url: embed.video.url,
-          proxyUrl: embed.video.proxy_url || embed.video.proxyURL || embed.video.url,
-          isVideo: true,
-        });
-      }
+    // --- Embeds (rich previews / gifv / image or video embeds) ---
+    if (Array.isArray(message.embeds)) {
+        for (const embed of message.embeds) {
+            // gifv (tenor, giphy …)
+            if (embed.type === "gifv" && embed.video) {
+                return {
+                    url:     embed.url || embed.video.url,
+                    proxyURL: embed.video.proxy_url || embed.video.url || embed.url,
+                    width:   embed.video.width  || 0,
+                    height:  embed.video.height || 0,
+                    isVideo: true
+                };
+            }
+            if (embed.video) {
+                return {
+                    url:     embed.video.url,
+                    proxyURL: embed.video.proxy_url || embed.video.url,
+                    width:   embed.video.width  || 0,
+                    height:  embed.video.height || 0,
+                    isVideo: true
+                };
+            }
+            if (embed.image) {
+                return {
+                    url:     embed.image.url,
+                    proxyURL: embed.image.proxy_url || embed.image.url,
+                    width:   embed.image.width  || 0,
+                    height:  embed.image.height || 0,
+                    isVideo: false
+                };
+            }
+        }
     }
-  }
 
-  return media;
+    return null;
 }
 
 // ---------------------------------------------------------------------------
-// Favourite action handler
+// The action-item object we push into the ActionSheet options array
 // ---------------------------------------------------------------------------
 
 /**
- * Attempt to favourite the first media item found.
- *
- * Priority:
- *   1. Discord's internal addToFavorites  (mirrors the native GIF ⭐ button)
- *   2. Native Share sheet                 (fallback — lets the user save it)
+ * @param {object} media  output of extractMedia()
  */
-async function favouriteMedia(mediaList) {
-  if (!mediaList || mediaList.length === 0) return;
-
-  const target = mediaList[0]; // favourite the first / most prominent media
-
-  // --- try Discord's own favourites API ------------------------------------
-  const favMod = findFavoritesModule();
-  if (favMod && typeof favMod.addToFavorites === "function") {
-    try {
-      favMod.addToFavorites({
-        src: target.proxyUrl || target.url,
-        url: target.url,
-        format: target.isVideo ? 2 : 1, // VIDEO = 2, IMAGE = 1
-      });
-      showToast("Added to favourites ⭐");
-      return;
-    } catch (e) {
-      console.warn("[FavouriteAnything] addToFavorites threw:", e);
-      // fall through to share-sheet fallback
-    }
-  }
-
-  // --- fallback: open the native Share sheet with the URL -------------------
-  try {
-    await Share.open({
-      message: target.url,
-      title: "Save media",
-    });
-  } catch (e) {
-    // User cancelled or share failed — show nothing
-    console.warn("[FavouriteAnything] Share.open cancelled or failed:", e);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Toast helper (cross-platform)
-// ---------------------------------------------------------------------------
-function showToast(message) {
-  if (Platform.OS === "android") {
-    ToastAndroid.showWithGravity(message, ToastAndroid.SHORT, ToastAndroid.BOTTOM);
-  }
-  // iOS: no built-in Toast.  You could swap this for a 3rd-party toast lib
-  // or just rely on the silent success of addToFavorites.
-}
-
-// ---------------------------------------------------------------------------
-// Plugin definition
-// ---------------------------------------------------------------------------
-
-let cleanups = [];
-
-module.exports = {
-  name: "FavouriteAnything",
-  description: "Adds a ⭐ Favourite button to the long-press menu on any message containing an image or video",
-  authors: [
-    { name: "nin0" },                          // original Vencord author
-    { name: "Davri", id: 457579346282938368n }, // original Vencord author
-  ],
-
-  onEnable() {
-    // ------------------------------------------------------------------
-    // 1. Locate the message-actions module
-    // ------------------------------------------------------------------
-    const found = findMessageActionsModule();
-    if (!found) {
-      console.error(
-        "[FavouriteAnything] Could not find the message-actions module.\n" +
-        "Install the 'ActionSheetFinder' dev plugin, long-press a message,\n" +
-        "and check the log to discover the current module key — then update\n" +
-        "the candidates list in findMessageActionsModule()."
-      );
-      return;
-    }
-
-    const { module: actionsModule, key: actionsKey } = found;
-    console.log("[FavouriteAnything] Patching module key:", actionsKey);
-
-    // ------------------------------------------------------------------
-    // 2. patcher.after — runs after the original function, receives its
-    //    return value so we can append our item without breaking anything.
-    //
-    //    The original function signature is roughly:
-    //      getMessageActions(message, channel, ...) => ActionItem[]
-    //
-    //    Each ActionItem looks like:
-    //      { label: string, icon?: any, onPress: () => void }
-    //    (exact shape varies by Discord version)
-    // ------------------------------------------------------------------
-    const unpatch = patcher.after(actionsKey, actionsModule, function (args, result) {
-      // args[0] is typically the message object
-      const message = args[0];
-
-      // Extract image / video content from the message
-      const media = extractMedia(message);
-      if (media.length === 0) {
-        // No visual media — don't pollute the menu
-        return result;
-      }
-
-      // Build our action item in the same shape Discord uses
-      const favouriteAction = {
+function buildFavouriteAction(media) {
+    return {
+        key:   "favouriteAnything",          // unique key so React doesn't complain
         label: "⭐ Favourite",
-        // icon: you can set this to a require()'d icon asset if you have one,
-        //        or leave it undefined — Discord will render label-only.
-        onPress: () => favouriteMedia(media),
-      };
+        onPress: () => {
+            const api = getFavouritesAPI();
+            if (api && typeof api.addToFavorites === "function") {
+                try {
+                    api.addToFavorites({
+                        src:    media.proxyURL,
+                        url:    media.url,
+                        width:  media.width,
+                        height: media.height,
+                        format: media.isVideo ? Format.VIDEO : Format.IMAGE
+                    });
+                    
+                    // Show toast notification
+                    const { showToast } = findByProps("showToast") || {};
+                    if (showToast) {
+                        showToast("Added to Favourites ⭐", 1);
+                    }
+                } catch (e) {
+                    console.error("[FavouriteAnything] addToFavorites threw:", e);
+                    const { showToast } = findByProps("showToast") || {};
+                    if (showToast) {
+                        showToast("Failed to favourite — check console.", 2);
+                    }
+                }
+            } else {
+                const { showToast } = findByProps("showToast") || {};
+                if (showToast) {
+                    showToast("Favourites API unavailable on this Discord build.", 2);
+                }
+            }
+        }
+    };
+}
 
-      // `result` might be an array directly, or an object with an `items`
-      // array depending on the Discord version.  Handle both.
-      if (Array.isArray(result)) {
-        result.push(favouriteAction);
-      } else if (result && Array.isArray(result.items)) {
-        result.items.push(favouriteAction);
-      } else if (result && Array.isArray(result.actions)) {
-        result.actions.push(favouriteAction);
-      }
+// ---------------------------------------------------------------------------
+// Core patch — hooks into the message-actions builder
+// ---------------------------------------------------------------------------
 
-      return result;
+let unpatch = null;   // cleanup handle from patcher.after
+
+/**
+ * patcher.after signature:  (methodName, object, callback)
+ *   callback(args, returnValue)  — args = original call args, returnValue = what the
+ *                                  original function returned.
+ *
+ * Discord mobile builds the long-press sheet in one of two ways:
+ *   A) A function that returns the options array directly.
+ *   B) A render function returning a React element that contains the array
+ *      somewhere in its props tree.
+ * We handle both.
+ */
+function applyPatch() {
+    const mod = getMessageActionsModule();
+    if (!mod) {
+        console.error(
+            "[FavouriteAnything] MessageActions module not found yet. " +
+            "Long-press any message once, then re-enable the plugin."
+        );
+        return;
+    }
+
+    // Get patcher from global bunny object
+    const { patcher } = window.bunny || {};
+    if (!patcher) {
+        console.error("[FavouriteAnything] Patcher not available!");
+        return;
+    }
+
+    // Resolve which exported function to patch.
+    // Try the most common named exports first, fall back to default.
+    const candidates = ["getActions", "buildActions", "default"];
+    let patchKey    = null;
+
+    for (const name of candidates) {
+        if (typeof mod[name] === "function") {
+            patchKey = name;
+            break;
+        }
+    }
+
+    if (!patchKey) {
+        console.error(
+            "[FavouriteAnything] No patchable function found on MessageActions. " +
+            "Available keys:",
+            Object.keys(mod)
+        );
+        return;
+    }
+
+    unpatch = patcher.after(patchKey, mod, function afterActions(args, ret) {
+        // ---------------------------------------------------------------
+        // 1. Pull the message object out of the arguments.
+        //    Shapes seen in the wild:
+        //      (message)            → args[0] is the message directly
+        //      ({ message, … })     → args[0].message
+        // ---------------------------------------------------------------
+        const message =
+            (args[0] && args[0].message) ||
+            args[0] ||
+            null;
+
+        const media = extractMedia(message);
+        if (!media) return ret;   // nothing to favourite, don't touch the sheet
+
+        // ---------------------------------------------------------------
+        // 2. Inject our action into the options array.
+        // ---------------------------------------------------------------
+
+        // --- Shape A: ret IS the options array ---
+        if (Array.isArray(ret)) {
+            ret.push(buildFavouriteAction(media));
+            return ret;
+        }
+
+        // --- Shape B: ret is a React element; options lives in props ---
+        if (ret && ret.props) {
+            // Direct child: ret.props.options
+            if (Array.isArray(ret.props.options)) {
+                ret.props.options.push(buildFavouriteAction(media));
+                return ret;
+            }
+            // One level deeper (common wrapper pattern)
+            if (Array.isArray(ret.props.children)) {
+                for (const child of ret.props.children) {
+                    if (child && child.props && Array.isArray(child.props.options)) {
+                        child.props.options.push(buildFavouriteAction(media));
+                        return ret;
+                    }
+                }
+            }
+        }
+
+        // Could not find the array — log for debugging but don't crash
+        console.warn(
+            "[FavouriteAnything] Could not locate options array. " +
+            "Return-value shape:",
+            ret
+        );
+        return ret;
     });
+}
 
-    cleanups.push(unpatch);
-    console.log("[FavouriteAnything] Enabled ⭐");
-  },
+// ---------------------------------------------------------------------------
+// Plugin definition  (Vendetta / Bunny / Kettu standard export)
+// ---------------------------------------------------------------------------
+export default {
+    onLoad: () => {
+        applyPatch();
+        console.log("[FavouriteAnything] Enabled");
+    },
 
-  onDisable() {
-    cleanups.forEach((fn) => {
-      try { fn(); } catch (e) { console.warn("[FavouriteAnything] cleanup error:", e); }
-    });
-    cleanups = [];
-    console.log("[FavouriteAnything] Disabled");
-  },
+    onUnload: () => {
+        if (typeof unpatch === "function") {
+            unpatch();
+            unpatch = null;
+        }
+        // Clear caches so a fresh enable re-resolves modules
+        _favouritesAPI  = null;
+        _messageActions = null;
+        console.log("[FavouriteAnything] Disabled");
+    }
 };
